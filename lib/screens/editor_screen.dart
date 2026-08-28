@@ -1,0 +1,1022 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:photo_manager/photo_manager.dart';
+import 'package:video_player/video_player.dart';
+
+// NEW IMPORTS
+import '../models/audio_clip_model.dart';
+import 'audio_editor_screen.dart';
+import '../services/audio_manager.dart';
+import '../widgets/audio_timeline_widget.dart';
+
+import '../models/media_clip.dart';
+import '../models/text_overlay_model.dart';
+import '../widgets/proportional_timeline_widget.dart';
+import '../widgets/timeline_ruler.dart';
+import '../services/video_player_manager.dart';
+import 'canvas_screen.dart';
+import 'text_editor_screen.dart';
+import 'dart:async';
+
+class EditorScreen extends StatefulWidget {
+  final List<MediaClip> mediaClips;
+
+  const EditorScreen({super.key, required this.mediaClips});
+
+  @override
+  State<EditorScreen> createState() => _EditorScreenState();
+}
+
+class _EditorScreenState extends State<EditorScreen> {
+  int _currentClipIndex = 0;
+  VideoPlayerController? _videoController;
+  bool _isPlaying = false;
+  bool _isVideoInitialized = false;
+  bool _isTransitioning = false;
+  DateTime _playbackStartTime = DateTime.now();
+  Duration _positionAtPlaybackStart = Duration.zero;
+  Duration _totalProjectDuration = Duration.zero;
+  static const double pixelsPerSecond = 20.0;
+
+  final ValueNotifier<Duration> _projectPositionNotifier = ValueNotifier(
+    Duration.zero,
+  );
+  List<MediaClip> _mediaClips = [];
+  Timer? _positionTimer;
+  int _imageStartTime = 0;
+
+  final VideoPlayerManager _videoManager = VideoPlayerManager();
+  // NEW: Audio Manager instance
+  final AudioManager _audioManager = AudioManager();
+
+  final ScrollController _timelineScrollController = ScrollController();
+  final ScrollController _rulerScrollController = ScrollController();
+
+  int _mediaInitVersion = 0;
+
+  final Map<String, double?> _aspectRatios = {};
+  final Map<String, Matrix4?> _transformations = {};
+
+  List<TextOverlay> _projectTextOverlays = [];
+  // NEW: State for audio clips
+  List<AudioClip> _projectAudioClips = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _mediaClips = List.from(widget.mediaClips);
+    _calculateTotalDuration();
+
+    _timelineScrollController.addListener(_syncRulerScroll);
+    _rulerScrollController.addListener(_syncTimelineScroll);
+
+    _initializeCurrentMedia();
+    _startPositionTimer();
+    _preloadInitialVideos();
+  }
+
+  @override
+  void dispose() {
+    _mediaInitVersion++;
+
+    _timelineScrollController.removeListener(_syncRulerScroll);
+    _rulerScrollController.removeListener(_syncTimelineScroll);
+    _timelineScrollController.dispose();
+    _rulerScrollController.dispose();
+
+    _videoManager.dispose();
+    // NEW: Dispose audio manager
+    _audioManager.dispose();
+    _positionTimer?.cancel();
+    _projectPositionNotifier.dispose();
+    super.dispose();
+  }
+
+  void _syncRulerScroll() {
+    if (_rulerScrollController.hasClients &&
+        !_rulerScrollController.position.isScrollingNotifier.value &&
+        _rulerScrollController.offset != _timelineScrollController.offset) {
+      _rulerScrollController.jumpTo(_timelineScrollController.offset);
+    }
+  }
+
+  void _syncTimelineScroll() {
+    if (_timelineScrollController.hasClients &&
+        !_timelineScrollController.position.isScrollingNotifier.value &&
+        _timelineScrollController.offset != _rulerScrollController.offset) {
+      _timelineScrollController.jumpTo(_rulerScrollController.offset);
+    }
+  }
+
+  void _startPositionTimer() {
+    _positionTimer?.cancel();
+    _positionTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+      if (mounted && _isPlaying) {
+        _updateProjectPosition();
+      }
+    });
+  }
+
+  void _updateProjectPosition() {
+    if (!_isPlaying || _isTransitioning || !mounted) return;
+
+    // --- NEW: This is the new, reliable logic for updating the timeline ---
+
+    // 1. Calculate the new position based on real-world time elapsed
+    final elapsed = DateTime.now().difference(_playbackStartTime);
+    final newPosition = _positionAtPlaybackStart + elapsed;
+
+    // 2. Update the ValueNotifier. This will make the white line move.
+    final clampedPosition = newPosition.clamp(
+      Duration.zero,
+      _totalProjectDuration,
+    );
+    _projectPositionNotifier.value = clampedPosition;
+
+    // NEW: Sync audio with the new, accurate position
+    _audioManager.seek(clampedPosition);
+
+    // 3. Check if it's time to switch to the next video/image clip
+    final currentClip = _mediaClips[_currentClipIndex];
+    final currentClipEndPosition =
+        _getClipStartOffset(_currentClipIndex) + currentClip.trimmedDuration;
+
+    if (clampedPosition >= currentClipEndPosition &&
+        _currentClipIndex < _mediaClips.length - 1) {
+      _moveToNextClip();
+    } else if (clampedPosition >= _totalProjectDuration) {
+      // End of the entire project
+      if (_isPlaying) _togglePlayPause();
+      _seekToPosition(Duration.zero);
+    }
+
+    // 4. Auto-scroll the timeline (this part remains the same)
+    if (_isPlaying && _timelineScrollController.hasClients) {
+      final double playheadX =
+          clampedPosition.inMilliseconds / 1000.0 * pixelsPerSecond;
+      final double viewportWidth =
+          _timelineScrollController.position.viewportDimension;
+      final double currentOffset = _timelineScrollController.offset;
+
+      final double safeZoneStart = currentOffset + viewportWidth * 0.3;
+      final double safeZoneEnd = currentOffset + viewportWidth * 0.7;
+
+      if (playheadX < safeZoneStart || playheadX > safeZoneEnd) {
+        final double targetOffset = playheadX - (viewportWidth / 2);
+        final double clampedOffset = targetOffset.clamp(
+          _timelineScrollController.position.minScrollExtent,
+          _timelineScrollController.position.maxScrollExtent,
+        );
+
+        _timelineScrollController.animateTo(
+          clampedOffset,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
+    }
+  }
+
+  // NEW: Add a helper to get the start time of any clip
+  Duration _getClipStartOffset(int index) {
+    Duration offset = Duration.zero;
+    for (int i = 0; i < index; i++) {
+      offset += _mediaClips[i].trimmedDuration;
+    }
+    return offset;
+  }
+
+  // NEW: Add a seek function to handle manual seeking and resetting the clock
+  Future<void> _seekToPosition(Duration targetPosition) async {
+    final clampedPosition = targetPosition.clamp(
+      Duration.zero,
+      _totalProjectDuration,
+    );
+    _projectPositionNotifier.value = clampedPosition;
+
+    // Reset the master clock's reference points whenever we seek
+    _positionAtPlaybackStart = clampedPosition;
+    _playbackStartTime = DateTime.now();
+
+    int targetClipIndex = 0;
+    Duration accumulatedDuration = Duration.zero;
+    for (int i = 0; i < _mediaClips.length; i++) {
+      final clipDuration = _mediaClips[i].trimmedDuration;
+      if (targetPosition <= accumulatedDuration + clipDuration) {
+        targetClipIndex = i;
+        break;
+      }
+      accumulatedDuration += clipDuration;
+    }
+
+    if (targetClipIndex != _currentClipIndex) {
+      setState(() => _currentClipIndex = targetClipIndex);
+      await _initializeCurrentMedia(wasPlaying: _isPlaying);
+    }
+
+    final positionInClip = targetPosition - accumulatedDuration;
+    final currentClip = _mediaClips[_currentClipIndex];
+
+    if (currentClip.asset.type == AssetType.video && _videoController != null) {
+      final seekTime = (currentClip.startTime + positionInClip).clamp(
+        currentClip.startTime,
+        currentClip.endTime,
+      );
+      await _videoController!.seekTo(seekTime);
+    } else if (currentClip.asset.type == AssetType.image) {
+      _imageStartTime =
+          DateTime.now().millisecondsSinceEpoch - positionInClip.inMilliseconds;
+    }
+
+    await _audioManager.seek(targetPosition);
+  }
+
+  void _calculateTotalDuration() {
+    _totalProjectDuration = _mediaClips.fold(
+      Duration.zero,
+      (total, clip) => total + clip.trimmedDuration,
+    );
+    if (mounted) setState(() {});
+  }
+
+  void _navigateToCanvasScreen() async {
+    if (_mediaClips.isEmpty) return;
+    final currentClip = _mediaClips[_currentClipIndex];
+
+    if (_isPlaying) await _togglePlayPause();
+
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CanvasScreen(
+          clip: currentClip,
+          videoManager: _videoManager,
+          initialAspectRatio: _aspectRatios[currentClip.asset.id],
+          initialTransformation: _transformations[currentClip.asset.id],
+        ),
+      ),
+    );
+
+    if (result == 'CANCEL' || result == null) return;
+
+    if (result is CanvasResult) {
+      setState(() {
+        if (result.applyToAll) {
+          for (var clip in _mediaClips) {
+            _aspectRatios[clip.asset.id] = result.aspectRatio;
+            _transformations[clip.asset.id] = result.transformation;
+          }
+        } else {
+          _aspectRatios[currentClip.asset.id] = result.aspectRatio;
+          _transformations[currentClip.asset.id] = result.transformation;
+        }
+      });
+    }
+  }
+
+  void _navigateToTextEditor() async {
+    if (widget.mediaClips.isEmpty) return;
+    if (_isPlaying) await _togglePlayPause();
+
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => TextEditorScreen(
+          mediaClips: _mediaClips,
+          canvasAspectRatio:
+              _aspectRatios[_mediaClips[_currentClipIndex].asset.id],
+          canvasTransform:
+              _transformations[_mediaClips[_currentClipIndex].asset.id],
+          videoManager: _videoManager,
+          initialOverlays: _projectTextOverlays,
+        ),
+      ),
+    );
+
+    if (result != null && result is TextEditorResult) {
+      setState(() {
+        _projectTextOverlays = result.overlays;
+      });
+    }
+  }
+
+  // NEW: Navigate to the Audio Editor Screen
+  void _navigateToAudioEditor() async {
+    if (widget.mediaClips.isEmpty) return;
+    if (_isPlaying) await _togglePlayPause();
+
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AudioEditorScreen(
+          mediaClips: _mediaClips,
+          initialAudioClips: _projectAudioClips,
+          videoManager: _videoManager,
+        ),
+      ),
+    );
+
+    if (result != null && result is AudioEditorResult) {
+      setState(() {
+        _projectAudioClips = result.audioClips;
+        // Update audio manager with the new clips
+        _audioManager.setClips(_projectAudioClips);
+      });
+    }
+  }
+
+  Future<void> _initializeCurrentMedia({bool wasPlaying = false}) async {
+    final int requestVersion = _mediaInitVersion;
+
+    if (_currentClipIndex >= _mediaClips.length) return;
+    final currentClip = _mediaClips[_currentClipIndex];
+
+    if (mounted) {
+      setState(() {
+        _isVideoInitialized = false;
+      });
+    }
+
+    try {
+      if (currentClip.asset.type == AssetType.video) {
+        final controller = await _videoManager.getController(currentClip);
+
+        if (!mounted || requestVersion != _mediaInitVersion) {
+          return;
+        }
+
+        setState(() {
+          _videoController = controller;
+          _isVideoInitialized =
+              controller != null && controller.value.isInitialized;
+        });
+
+        if (wasPlaying && _videoController != null) {
+          await _videoController!.seekTo(currentClip.startTime);
+          await _videoController!.play();
+        }
+        _preloadNextVideos();
+      } else {
+        // Image asset
+        await _videoManager.getController(currentClip);
+
+        if (!mounted || requestVersion != _mediaInitVersion) return;
+
+        setState(() {
+          _videoController = null;
+          _isVideoInitialized = false;
+        });
+        _imageStartTime = DateTime.now().millisecondsSinceEpoch;
+      }
+    } catch (e) {
+      print('Error initializing media: $e');
+      if (mounted && requestVersion == _mediaInitVersion) {
+        setState(() {
+          _isVideoInitialized = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _moveToNextClip() async {
+    // NEW: Add guard to prevent multiple transitions at once
+    if (_isTransitioning) return;
+
+    setState(() {
+      _isTransitioning = true;
+    });
+
+    try {
+      if (_currentClipIndex < _mediaClips.length - 1) {
+        setState(() {
+          _currentClipIndex++;
+        });
+        await _initializeCurrentMedia(wasPlaying: _isPlaying);
+      } else {
+        if (mounted)
+          setState(() {
+            _isPlaying = false;
+          });
+        await _videoController?.pause();
+        await _audioManager.pause();
+        _projectPositionNotifier.value = _totalProjectDuration;
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTransitioning = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _jumpToClip(int clipIndex) async {
+    if (clipIndex == _currentClipIndex) return;
+
+    final wasPlaying = _isPlaying;
+    if (wasPlaying) {
+      await _togglePlayPause();
+    }
+
+    _mediaInitVersion++;
+
+    setState(() {
+      _currentClipIndex = clipIndex;
+    });
+
+    await _initializeCurrentMedia(wasPlaying: wasPlaying);
+
+    _updateProjectPosition();
+  }
+
+  Future<void> _preloadInitialVideos() async {
+    for (int i = 0; i <= 2; i++) {
+      if (i < _mediaClips.length) {
+        final clip = _mediaClips[i];
+        if (clip.asset.type == AssetType.video) {
+          await _videoManager.preloadNextVideo(clip);
+        }
+      }
+    }
+  }
+
+  Future<void> _togglePlayPause() async {
+    setState(() {
+      _isPlaying = !_isPlaying;
+    });
+
+    if (_isPlaying) {
+      // NEW: Record the starting point for our new "master clock"
+      _playbackStartTime = DateTime.now();
+      _positionAtPlaybackStart = _projectPositionNotifier.value;
+
+      await _audioManager.play(_projectPositionNotifier.value);
+
+      if (_mediaClips[_currentClipIndex].asset.type == AssetType.video) {
+        if (_videoController != null && _isVideoInitialized) {
+          final currentClip = _mediaClips[_currentClipIndex];
+          if (_videoController!.value.position >= currentClip.endTime) {
+            await _videoController!.seekTo(currentClip.startTime);
+          }
+          await _videoController!.play();
+        }
+      } else {
+        // Image
+        final clipStartOffset = _getClipStartOffset(_currentClipIndex);
+        final positionInClip = _projectPositionNotifier.value - clipStartOffset;
+        _imageStartTime =
+            DateTime.now().millisecondsSinceEpoch -
+            positionInClip.inMilliseconds;
+      }
+    } else {
+      await _audioManager.pause();
+      if (_mediaClips[_currentClipIndex].asset.type == AssetType.video) {
+        await _videoController?.pause();
+      }
+    }
+  }
+
+  Future<void> _preloadNextVideos() async {
+    for (int i = 1; i <= 2; i++) {
+      if (_currentClipIndex + i < _mediaClips.length) {
+        final clip = _mediaClips[_currentClipIndex + i];
+        if (clip.asset.type == AssetType.video) {
+          await _videoManager.preloadNextVideo(clip);
+        }
+      }
+    }
+  }
+
+  void _onClipTrimmed(
+    int clipIndex,
+    Duration newStartTime,
+    Duration newEndTime,
+  ) {
+    setState(() {
+      _mediaClips[clipIndex] = _mediaClips[clipIndex].copyWith(
+        startTime: newStartTime,
+        endTime: newEndTime,
+      );
+    });
+    _calculateTotalDuration();
+    if (clipIndex == _currentClipIndex) {
+      _mediaInitVersion++;
+      _initializeCurrentMedia(wasPlaying: _isPlaying);
+    }
+  }
+
+  String _formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    final minutes = twoDigits(duration.inMinutes.remainder(60));
+    final seconds = twoDigits(duration.inSeconds.remainder(60));
+    final milliseconds = (duration.inMilliseconds.remainder(1000) / 10).floor();
+    return '${twoDigits(int.parse(minutes))}:${twoDigits(int.parse(seconds))}.${twoDigits(milliseconds)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // UPDATED: The height of the timeline container is now dynamic
+    final double timelineHeight = 140.0 + (_projectAudioClips.length * 50.0);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF1A1A1A),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF2A2A2A),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.purple.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Icon(
+                Icons.help_outline,
+                color: Colors.white,
+                size: 20,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: _showExportDialog,
+            child: const Text(
+              'Export',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            flex: 3,
+            child: Container(
+              width: double.infinity,
+              color: const Color(0xFF1A1A1A),
+              child: Center(
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    _buildPreview(),
+                    Positioned.fill(
+                      child: GestureDetector(
+                        onTap: _togglePlayPause,
+                        child: Container(
+                          color: Colors.transparent,
+                          child: Center(
+                            child: AnimatedOpacity(
+                              opacity: _isPlaying ? 0.0 : 1.0,
+                              duration: const Duration(milliseconds: 300),
+                              child: Container(
+                                width: 80,
+                                height: 80,
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.7),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  _isPlaying ? Icons.pause : Icons.play_arrow,
+                                  color: Colors.white,
+                                  size: 40,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 20,
+                      left: 20,
+                      right: 20,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.7),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            ValueListenableBuilder<Duration>(
+                              valueListenable: _projectPositionNotifier,
+                              builder: (context, position, child) {
+                                return Text(
+                                  _formatDuration(position),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                  ),
+                                );
+                              },
+                            ),
+                            Text(
+                              _formatDuration(_totalProjectDuration),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Container(
+            height: 100,
+            color: const Color(0xFF2A2A2A),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildToolButton(
+                  Icons.crop_free,
+                  'Canvas',
+                  false,
+                  onPressed: _navigateToCanvasScreen,
+                ),
+                // UPDATED: Audio button now navigates to the new screen
+                _buildToolButton(
+                  Icons.music_note,
+                  'Audio',
+                  false,
+                  onPressed: _navigateToAudioEditor,
+                ),
+                _buildToolButton(Icons.emoji_emotions, 'Sticker', false),
+                _buildToolButton(
+                  Icons.text_fields,
+                  'Text',
+                  false,
+                  onPressed: _navigateToTextEditor,
+                ),
+                _buildToolButton(Icons.auto_awesome, 'Effect', true),
+                _buildToolButton(Icons.filter, 'Filter', false),
+                _buildToolButton(Icons.picture_in_picture, 'PIP', false),
+              ],
+            ),
+          ),
+          // UPDATED: Timeline container now has a dynamic height
+          Container(
+            height: timelineHeight,
+            color: const Color(0xFF1A1A1A),
+            child: Column(
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Container(
+                        margin: const EdgeInsets.all(16),
+                        child: FloatingActionButton(
+                          onPressed: () {},
+                          backgroundColor: Colors.red,
+                          mini: true,
+                          child: const Icon(Icons.add, color: Colors.white),
+                        ),
+                      ),
+                      Expanded(child: _buildProportionalTimeline()),
+                    ],
+                  ),
+                ),
+                Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 56),
+                  child: _buildTimelineRuler(),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPreview() {
+    if (_mediaClips.isEmpty || _currentClipIndex >= _mediaClips.length) {
+      return const Text(
+        'No media selected',
+        style: TextStyle(color: Colors.white),
+      );
+    }
+
+    final currentClip = _mediaClips[_currentClipIndex];
+    final canvasAspectRatio = _aspectRatios[currentClip.asset.id];
+    final transformation = _transformations[currentClip.asset.id];
+    Widget? content;
+    double? intrinsicAspectRatio;
+
+    if (currentClip.asset.type == AssetType.video &&
+        _isVideoInitialized &&
+        _videoController != null &&
+        _videoController!.value.isInitialized) {
+      content = VideoPlayer(_videoController!);
+      intrinsicAspectRatio = _videoController!.value.aspectRatio;
+    } else if (currentClip.asset.type == AssetType.image) {
+      content = FutureBuilder<Widget>(
+        future: _buildImagePreview(currentClip.asset),
+        builder: (context, snapshot) {
+          if (snapshot.hasData) return snapshot.data!;
+          return const CircularProgressIndicator(
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.purple),
+          );
+        },
+      );
+      intrinsicAspectRatio = currentClip.asset.width / currentClip.asset.height;
+    } else {
+      return const Center(
+        child: CircularProgressIndicator(
+          valueColor: AlwaysStoppedAnimation<Color>(Colors.purple),
+        ),
+      );
+    }
+
+    final visibleOverlays = _projectTextOverlays.where(
+      (overlay) =>
+          _projectPositionNotifier.value >= overlay.startTime &&
+          _projectPositionNotifier.value <= overlay.endTime,
+    );
+
+    return AspectRatio(
+      aspectRatio: canvasAspectRatio ?? intrinsicAspectRatio ?? 16 / 9,
+      child: Container(
+        color: Colors.black,
+        child: ClipRect(
+          child: Transform(
+            transform: transformation ?? Matrix4.identity(),
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: intrinsicAspectRatio ?? 16 / 9,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (content != null) content,
+                    ...visibleOverlays.map(
+                      (overlay) => Positioned(
+                        left: overlay.position.dx,
+                        top: overlay.position.dy,
+                        child: Transform.rotate(
+                          angle: overlay.angle,
+                          child: Transform.scale(
+                            scale: overlay.scale,
+                            child: Text(overlay.text, style: overlay.style),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<Widget> _buildImagePreview(AssetEntity asset) async {
+    try {
+      final file = await asset.file;
+      if (file != null) {
+        return Image.file(file, fit: BoxFit.cover);
+      }
+    } catch (e) {
+      print('Error loading image preview: $e');
+    }
+    return const Text(
+      'Error loading preview',
+      style: TextStyle(color: Colors.white),
+    );
+  }
+
+  Widget _buildToolButton(
+    IconData icon,
+    String label,
+    bool hasNotification, {
+    VoidCallback? onPressed,
+  }) {
+    return InkWell(
+      onTap: onPressed,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.all(8.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Icon(icon, color: Colors.white, size: 24),
+                if (hasNotification)
+                  Positioned(
+                    right: -4,
+                    top: -4,
+                    child: Container(
+                      width: 8,
+                      height: 8,
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white, fontSize: 10),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // UPDATED: This now builds the video, text, AND audio timelines
+  Widget _buildProportionalTimeline() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double totalTimelineWidth =
+            _totalProjectDuration.inMilliseconds / 1000.0 * pixelsPerSecond;
+        return SingleChildScrollView(
+          controller: _timelineScrollController,
+          scrollDirection: Axis.horizontal,
+          child: ValueListenableBuilder<Duration>(
+            valueListenable: _projectPositionNotifier,
+            builder: (context, position, child) {
+              return SizedBox(
+                width: totalTimelineWidth,
+                child: Stack(
+                  children: [
+                    // Layer 1: The video clips at the bottom
+                    Positioned(
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      height: 80,
+                      child: ProportionalTimelineWidget(
+                        mediaClips: _mediaClips,
+                        currentClipIndex: _currentClipIndex,
+                        currentProjectPosition: position,
+                        totalProjectDuration: _totalProjectDuration,
+                        onClipTap: _jumpToClip,
+                        onTrimChanged: _onClipTrimmed,
+                        timelineWidth: totalTimelineWidth,
+                        pixelsPerSecond: pixelsPerSecond,
+                      ),
+                    ),
+                    // NEW: Layer 2: The audio clips, stacked above the video
+                    ..._projectAudioClips.asMap().entries.map((entry) {
+                      int index = entry.key;
+                      AudioClip clip = entry.value;
+                      return AudioTimelineWidget(
+                        audioClip: clip,
+                        pixelsPerSecond: pixelsPerSecond,
+                        isSelected: false, // Not selectable in main editor
+                        topPosition: 10.0 + (index * 50.0),
+                        totalProjectDuration: _totalProjectDuration,
+                        onTap: () {}, // No action on tap here
+                        onDurationChanged: (_, __) {},
+                        onPositionChanged:
+                            (Duration dragDelta) {}, // Not editable here
+                      );
+                    }).toList(),
+                    // Layer 3: The playhead
+                    _buildPlayhead(totalTimelineWidth, position),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPlayhead(double timelineWidth, Duration position) {
+    final double indicatorPosition =
+        (position.inMilliseconds / 1000.0 * pixelsPerSecond).clamp(
+          0.0,
+          timelineWidth,
+        );
+
+    return Positioned(
+      left: indicatorPosition - 1.5, // Center the line
+      top: 0,
+      bottom: 0,
+      child: Container(
+        width: 3,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(1.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.8),
+              blurRadius: 4,
+              offset: const Offset(0, 1),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 0,
+              height: 0,
+              decoration: const BoxDecoration(
+                border: Border(
+                  left: BorderSide(width: 6, color: Colors.transparent),
+                  right: BorderSide(width: 6, color: Colors.transparent),
+                  bottom: BorderSide(width: 8, color: Colors.white),
+                ),
+              ),
+            ),
+            Expanded(child: Container(width: 3, color: Colors.white)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTimelineRuler() {
+    final double totalTimelineWidth =
+        _totalProjectDuration.inMilliseconds / 1000.0 * pixelsPerSecond;
+
+    return SingleChildScrollView(
+      controller: _rulerScrollController,
+      scrollDirection: Axis.horizontal,
+      physics: const NeverScrollableScrollPhysics(),
+      child: SizedBox(
+        width: totalTimelineWidth,
+        height: 40,
+        child: TimelineRuler(
+          totalDuration: _totalProjectDuration,
+          pixelsPerSecond: pixelsPerSecond,
+        ),
+      ),
+    );
+  }
+
+  void _showExportDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF2A2A2A),
+          title: const Text(
+            'Export Project',
+            style: TextStyle(color: Colors.white),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Total Duration: ${_formatDuration(_totalProjectDuration)}',
+                style: const TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Clips: ${_mediaClips.length}',
+                style: const TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Audio Tracks: ${_projectAudioClips.length}',
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+              },
+              child: const Text(
+                'Export',
+                style: TextStyle(color: Colors.purple),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
